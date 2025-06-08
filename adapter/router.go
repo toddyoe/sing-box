@@ -41,6 +41,7 @@ type Router interface {
 	AppendTracker(tracker ConnectionTracker)
 
 	ResetNetwork()
+	Reload()
 }
 
 type ConnectionTracker interface {
