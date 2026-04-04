@@ -125,6 +125,7 @@ func (r *Router) Start(stage adapter.StartStage) error {
 		if cacheContext != nil {
 			cacheContext.Close()
 		}
+		r.network.RegisterNetworkResetCallback(r.dns.ResetNetwork)
 		needFindProcess := r.needFindProcess
 		for _, ruleSet := range r.ruleSets {
 			metadata := ruleSet.Metadata()
@@ -225,7 +226,6 @@ func (r *Router) AppendTracker(tracker adapter.ConnectionTracker) {
 
 func (r *Router) ResetNetwork() {
 	r.network.ResetNetwork()
-	r.dns.ResetNetwork()
 }
 
 const quicSniffCacheTTL = 5 * time.Minute
