@@ -3,6 +3,7 @@ package option
 import (
 	"context"
 	"reflect"
+	"strings"
 
 	"github.com/sagernet/sing-box/schema"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -66,6 +67,7 @@ type ProviderLocalOptions struct {
 	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
 	OverrideTLS    *OverrideTLSOptions    `json:"override_tls,omitempty"`
 	OverrideAnyTLS *OverrideAnyTLSOptions `json:"override_anytls,omitempty"`
+	OverrideTag    *OverrideTagOptions    `json:"override_tag,omitempty"`
 }
 
 type ProviderRemoteOptions struct {
@@ -83,6 +85,7 @@ type ProviderRemoteOptions struct {
 	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
 	OverrideTLS    *OverrideTLSOptions    `json:"override_tls,omitempty"`
 	OverrideAnyTLS *OverrideAnyTLSOptions `json:"override_anytls,omitempty"`
+	OverrideTag    *OverrideTagOptions    `json:"override_tag,omitempty"`
 
 	// Deprecated: use http_client instead
 	DownloadDetour string `json:"download_detour,omitempty" reference:"outbound" schema:"omit"`
@@ -147,6 +150,45 @@ type ProviderHealthCheckOptions struct {
 	URL      string             `json:"url,omitempty"`
 	Interval badoption.Duration `json:"interval,omitempty"`
 	Timeout  badoption.Duration `json:"timeout,omitempty"`
+}
+
+type OverrideTagOptions struct {
+	AdditionalPrefix string `json:"additional_prefix,omitempty"`
+	AdditionalSuffix string `json:"additional_suffix,omitempty"`
+	WithProvider     bool   `json:"with_provider,omitempty"`
+}
+
+func (o *OverrideTagOptions) UnmarshalJSON(content []byte) error {
+	type native OverrideTagOptions
+	var decoded native
+	err := json.Unmarshal(content, &decoded)
+	if err != nil {
+		return err
+	}
+	decoded.AdditionalPrefix = strings.TrimSpace(decoded.AdditionalPrefix)
+	decoded.AdditionalSuffix = strings.TrimSpace(decoded.AdditionalSuffix)
+	*o = OverrideTagOptions(decoded)
+	return nil
+}
+
+func (o *OverrideTagOptions) Apply(tag string) string {
+	if o == nil {
+		return tag
+	}
+	prefix := strings.TrimSpace(o.AdditionalPrefix)
+	suffix := strings.TrimSpace(o.AdditionalSuffix)
+	if prefix == "" && suffix == "" {
+		return tag
+	}
+	return prefix + tag + suffix
+}
+
+func (o *OverrideTagOptions) Resolve(tag string, providerTag string) string {
+	tag = o.Apply(tag)
+	if o != nil && o.WithProvider && providerTag != "" {
+		return "[" + providerTag + "] " + tag
+	}
+	return tag
 }
 
 type OverrideDialerOptions struct {
