@@ -1,0 +1,242 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version name (leave empty to calculate)"
+        required: false
+        type: string
+  push:
+    branches:
+      - reF1nd-testing
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  calculate_version:
+    name: Calculate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.outputs.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.6
+          cache: false
+      - name: Cache Go modules
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-linux-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-linux-
+      - name: Cache Go tool builds
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/go-build
+          key: go-build-tools-linux-${{ hashFiles('go.sum') }}
+          restore-keys: go-build-tools-linux-
+      - name: Check input version
+        if: github.event_name == 'workflow_dispatch' && inputs.version != ''
+        run: |-
+          echo "version=${{ inputs.version }}"
+          echo "version=${{ inputs.version }}" >> "$GITHUB_ENV"
+      - name: Calculate version
+        if: github.event_name != 'workflow_dispatch' || inputs.version == ''
+        run: |-
+          go run -v ./cmd/internal/read_tag --ci --nightly
+      - name: Set outputs
+        id: outputs
+        run: |-
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build_windows:
+    name: Build Windows amd64
+    runs-on: windows-latest
+    needs:
+      - calculate_version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.6
+          cache: false
+      - name: Cache Go modules
+        uses: actions/cache@v6
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-windows-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-windows-
+      - name: Set tag
+        run: |-
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+      - name: Build
+        run: |
+          $TAGS = Get-Content release/DEFAULT_BUILD_TAGS_WINDOWS
+          $LDFLAGS_SHARED = Get-Content release/LDFLAGS
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box.exe -tags "$TAGS" `
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' $LDFLAGS_SHARED -s -w -buildid=" `
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Extract libcronet.dll
+        run: |
+          $CRONET_GO_VERSION = Get-Content .github/CRONET_GO_VERSION
+          $LIBRARY_PATH = "lib/windows_amd64/libcronet.dll"
+          git init "$env:RUNNER_TEMP/cronet-go-lib"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
+          Copy-Item "$env:RUNNER_TEMP/cronet-go-lib/$LIBRARY_PATH" dist
+      - name: Archive
+        run: |
+          $SHORT_SHA = (git rev-parse --short HEAD)
+          $DIR_NAME = "sing-box-$SHORT_SHA-windows-amd64"
+          mkdir "dist/$DIR_NAME"
+          Copy-Item LICENSE "dist/$DIR_NAME"
+          Copy-Item "dist/sing-box.exe" "dist/$DIR_NAME"
+          Copy-Item "dist/libcronet.dll" "dist/$DIR_NAME"
+          Compress-Archive -Path "dist/$DIR_NAME" -DestinationPath "dist/$DIR_NAME.zip"
+          Remove-Item -Recurse "dist/$DIR_NAME"
+      - name: Cleanup
+        run: Remove-Item dist/sing-box.exe, dist/libcronet.dll
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-windows_amd64
+          path: "dist"
+
+  upload:
+    name: Upload builds
+    if: success()
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+      - build_windows
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.calculate_version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Set tag
+        run: |-
+          set -euo pipefail
+          git fetch --tags --force origin
+          TAG="v${VERSION}"
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "PREV_SHA=$(git rev-parse "${TAG}^{commit}")" >> "$GITHUB_ENV"
+          fi
+          git tag "$TAG" -f
+      - name: Download builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: "dist/**"
+      - name: Generate release notes
+        run: |-
+          set -euo pipefail
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
+          LOG_RANGE=""
+          PREV_LINE=""
+
+          PREV_BUILD=""
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            PREV_BUILD="$(
+              gh release view "$TAG" --json assets --jq '.assets | sort_by(.updatedAt) | reverse | .[].name' \
+                | sed -n 's/^sing-box-\([0-9a-f][0-9a-f]*\)-windows-amd64\.zip$/\1/p' \
+                | head -1 || true
+            )"
+          fi
+          if [ -n "${PREV_BUILD}" ] && git cat-file -e "${PREV_BUILD}^{commit}" 2>/dev/null; then
+            LOG_RANGE="${PREV_BUILD}..HEAD"
+            PREV_LINE="Since previous build \`${PREV_BUILD}\`:"
+          elif [ -n "${PREV_SHA:-}" ] && [ "${PREV_SHA}" != "$(git rev-parse HEAD)" ] && git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
+            LOG_RANGE="${PREV_SHA}..HEAD"
+            PREV_LINE="Since \`$(git rev-parse --short "${PREV_SHA}")\`:"
+          fi
+
+          {
+            echo "## Changes"
+            echo
+            echo "Commit: \`${SHORT_SHA}\`"
+            echo
+            if [ -n "${LOG_RANGE}" ]; then
+              echo "${PREV_LINE}"
+              echo
+              git log --pretty=format:'- %s (%h)' "${LOG_RANGE}"
+              echo
+            else
+              echo "Recent commits:"
+              echo
+              git log --pretty=format:'- %s (%h)' -20
+              echo
+            fi
+          } > "${NOTES_FILE}"
+          if [ ! -s "${NOTES_FILE}" ]; then
+            printf '## Changes\n\nCommit: `%s`\n' "${SHORT_SHA}" > "${NOTES_FILE}"
+          fi
+          echo "NOTES_FILE=${NOTES_FILE}" >> "$GITHUB_ENV"
+          echo "----- release notes -----"
+          cat "${NOTES_FILE}"
+      - name: Publish release
+        run: |-
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*.zip)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no zip artifacts under dist/"
+            exit 1
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            mapfile -t assets < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+            for name in "${assets[@]}"; do
+              [ -n "$name" ] || continue
+              echo "deleting old asset: ${name}"
+              gh release delete-asset "$TAG" "$name" --yes
+            done
+            gh release edit "$TAG" \
+              --title "sing-box ${VERSION}" \
+              --notes-file "${NOTES_FILE}" \
+              --prerelease \
+              --draft=false
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --title "sing-box ${VERSION}" \
+              --notes-file "${NOTES_FILE}" \
+              --target "${GITHUB_SHA}" \
+              --prerelease
+          fi

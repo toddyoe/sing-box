@@ -1,0 +1,109 @@
+name: Sync
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-reF1nd-testing
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Rebase onto upstream and reapply local commits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: reF1nd-testing
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ github.token }}
+
+      - name: Sync upstream and reapply local commits
+        env:
+          UPSTREAM_URL: https://github.com/reF1nd/sing-box.git
+          UPSTREAM_BRANCH: reF1nd-testing
+          LOCAL_BRANCH: reF1nd-testing
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --no-tags origin "$LOCAL_BRANCH"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+          git checkout -B "$LOCAL_BRANCH" "origin/$LOCAL_BRANCH"
+
+          UPSTREAM_REF="upstream/$UPSTREAM_BRANCH"
+          if git merge-base --is-ancestor "$UPSTREAM_REF" HEAD; then
+            echo "Already based on $UPSTREAM_REF, nothing to sync"
+            exit 0
+          fi
+
+          OUR_COMMITS_FILE="$(mktemp)"
+          git rev-list --reverse --no-merges "$UPSTREAM_REF..HEAD" > "$OUR_COMMITS_FILE"
+
+          echo "Local-only commits to reapply:"
+          if [ -s "$OUR_COMMITS_FILE" ]; then
+            git log --oneline --no-merges "$UPSTREAM_REF..HEAD"
+          else
+            echo "(none)"
+          fi
+
+          # Phase 1: force-sync to upstream. Linear history (rebase-style, no merge commit).
+          # Any local divergence is discarded in favor of upstream.
+          git reset --hard "$UPSTREAM_REF"
+
+          # Phase 2: replay this repository's own commits on top of the synced tree.
+          apply_commit() {
+            local sha="$1"
+            local subject
+            subject="$(git log -1 --format='%s' "$sha")"
+            echo "Applying $sha $subject"
+
+            set +e
+            git cherry-pick -x "$sha"
+            local status=$?
+            set -e
+
+            if [ "$status" -eq 0 ]; then
+              return 0
+            fi
+
+            local conflicts
+            conflicts="$(git diff --name-only --diff-filter=U || true)"
+            if [ -z "$conflicts" ]; then
+              echo "Skipping empty or already-applied commit $sha"
+              git cherry-pick --skip || git cherry-pick --abort || true
+              return 0
+            fi
+
+            # Apply-local-commits phase: keep this repository's incoming changes on conflict.
+            echo "Conflict while applying $sha, taking this repository's commit"
+            git checkout --theirs -- .
+            git add -A
+            if git diff --cached --quiet; then
+              git cherry-pick --skip || git cherry-pick --abort || true
+              return 0
+            fi
+            GIT_EDITOR=true git cherry-pick --continue
+          }
+
+          if [ -s "$OUR_COMMITS_FILE" ]; then
+            while read -r sha; do
+              apply_commit "$sha"
+            done < "$OUR_COMMITS_FILE"
+          fi
+
+          echo "Resulting commits on top of upstream:"
+          git log --oneline "$UPSTREAM_REF..HEAD" || true
+
+          git push --force-with-lease="refs/heads/${LOCAL_BRANCH}:origin/${LOCAL_BRANCH}" origin "HEAD:${LOCAL_BRANCH}"
