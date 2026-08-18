@@ -9,6 +9,100 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestParseV2RayWebsocketEarlyData(t *testing.T) {
+	testCases := []struct {
+		name                string
+		path                string
+		maxEarlyData        uint32
+		earlyDataHeaderName string
+		wantPath            string
+		wantMaxEarlyData    uint32
+		wantHeaderName      string
+	}{
+		{
+			name:             "basic query",
+			path:             "/?ed=2560",
+			wantPath:         "/",
+			wantMaxEarlyData: 2560,
+			wantHeaderName:   "Sec-WebSocket-Protocol",
+		},
+		{
+			name:             "plain path",
+			path:             "/ws",
+			wantPath:         "/ws",
+			wantMaxEarlyData: 0,
+			wantHeaderName:   "",
+		},
+		{
+			name:             "explicit max-early-data wins",
+			path:             "/?ed=2560",
+			maxEarlyData:     1024,
+			wantPath:         "/",
+			wantMaxEarlyData: 1024,
+			wantHeaderName:   "Sec-WebSocket-Protocol",
+		},
+		{
+			name:                "explicit header name wins",
+			path:                "/?ed=2560",
+			earlyDataHeaderName: "Custom-Header",
+			wantPath:            "/",
+			wantMaxEarlyData:    2560,
+			wantHeaderName:      "Custom-Header",
+		},
+		{
+			name:             "preserve extra query",
+			path:             "/ws?foo=bar&ed=2560",
+			wantPath:         "/ws?foo=bar",
+			wantMaxEarlyData: 2560,
+			wantHeaderName:   "Sec-WebSocket-Protocol",
+		},
+		{
+			name:             "invalid ed",
+			path:             "/?ed=abc",
+			wantPath:         "/?ed=abc",
+			wantMaxEarlyData: 0,
+			wantHeaderName:   "",
+		},
+		{
+			name:             "zero ed",
+			path:             "/?ed=0",
+			wantPath:         "/?ed=0",
+			wantMaxEarlyData: 0,
+			wantHeaderName:   "",
+		},
+		{
+			name:             "empty path",
+			path:             "",
+			wantPath:         "",
+			wantMaxEarlyData: 0,
+			wantHeaderName:   "",
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			path, maxEarlyData, headerName := parseV2RayWebsocketEarlyData(
+				testCase.path,
+				testCase.maxEarlyData,
+				testCase.earlyDataHeaderName,
+			)
+			require.Equal(t, testCase.wantPath, path)
+			require.Equal(t, testCase.wantMaxEarlyData, maxEarlyData)
+			require.Equal(t, testCase.wantHeaderName, headerName)
+		})
+	}
+}
+
+func TestParseVLESSLinkWebSocketEarlyData(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("vless://11111111-1111-1111-1111-111111111111@192.0.2.1:443?type=ws&path=%2F%3Fed%3D2560&host=example.com&security=tls&sni=example.com")
+	require.NoError(t, err)
+
+	options := outbound.Options.(*option.VLESSOutboundOptions)
+	require.NotNil(t, options.Transport)
+	require.Equal(t, "/", options.Transport.WebsocketOptions.Path)
+	require.Equal(t, uint32(2560), options.Transport.WebsocketOptions.MaxEarlyData)
+	require.Equal(t, "Sec-WebSocket-Protocol", options.Transport.WebsocketOptions.EarlyDataHeaderName)
+}
+
 func TestParseVMessLinkSNI(t *testing.T) {
 	link := "vmess://" + base64.RawURLEncoding.EncodeToString([]byte(`{"add":"192.0.2.1","port":"443","id":"11111111-1111-1111-1111-111111111111","tls":"tls","sni":"example.com"}`))
 	outbound, err := ParseSubscriptionLink(link)
