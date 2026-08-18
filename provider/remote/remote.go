@@ -134,7 +134,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 	logger := logFactory.NewLogger(F.ToString("provider/remote", "[", tag, "]"))
 	url := options.URL
 	return &ProviderRemote{
-		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeRemote, options.HealthCheck),
+		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeRemote, options.HealthCheck, options.OverrideTag),
 		ctx:      ctx,
 		cancel:   cancel,
 		logger:   logger,
@@ -459,9 +459,9 @@ func (s *ProviderRemote) loadFromContent(contentRaw []byte) error {
 	if err != nil {
 		return err
 	}
-	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
+	s.UpdateOutbounds(s.lastOutOpts, outboundOpts, endpointOpts)
 	s.lastOutOpts = outboundOpts
-	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
+	s.UpdateEndpoints(s.lastEPOpts, endpointOpts, outboundOpts)
 	s.lastEPOpts = endpointOpts
 	return nil
 }
@@ -545,7 +545,7 @@ func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionIn
 }
 
 func (s *ProviderRemote) updateProviderFromContent(content string) error {
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.overrideTLS, s.overrideAnyTLS, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.overrideTLS, s.overrideAnyTLS)
 	if err != nil {
 		return err
 	}
@@ -555,9 +555,9 @@ func (s *ProviderRemote) updateProviderFromContent(content string) error {
 	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool {
 		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
 	})
-	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
+	s.UpdateOutbounds(s.lastOutOpts, outboundOpts, endpointOpts)
 	s.lastOutOpts = outboundOpts
-	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
+	s.UpdateEndpoints(s.lastEPOpts, endpointOpts, outboundOpts)
 	s.lastEPOpts = endpointOpts
 	return nil
 }

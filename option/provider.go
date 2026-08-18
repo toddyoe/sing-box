@@ -3,6 +3,8 @@ package option
 import (
 	"context"
 	"reflect"
+	"strings"
+	"unicode"
 
 	"github.com/sagernet/sing-box/schema"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -66,6 +68,7 @@ type ProviderLocalOptions struct {
 	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
 	OverrideTLS    *OverrideTLSOptions    `json:"override_tls,omitempty"`
 	OverrideAnyTLS *OverrideAnyTLSOptions `json:"override_anytls,omitempty"`
+	OverrideTag    *OverrideTagOptions    `json:"override_tag,omitempty"`
 }
 
 type ProviderRemoteOptions struct {
@@ -83,6 +86,7 @@ type ProviderRemoteOptions struct {
 	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
 	OverrideTLS    *OverrideTLSOptions    `json:"override_tls,omitempty"`
 	OverrideAnyTLS *OverrideAnyTLSOptions `json:"override_anytls,omitempty"`
+	OverrideTag    *OverrideTagOptions    `json:"override_tag,omitempty"`
 
 	// Deprecated: use http_client instead
 	DownloadDetour string `json:"download_detour,omitempty" reference:"outbound" schema:"omit"`
@@ -149,9 +153,43 @@ type ProviderHealthCheckOptions struct {
 	Timeout  badoption.Duration `json:"timeout,omitempty"`
 }
 
-type OverrideAnyTLSOptions struct {
-	ClientMetadata *string `json:"client_metadata,omitempty"`
-	DisableReuse   *bool   `json:"disable_reuse,omitempty"`
+type OverrideTagOptions struct {
+	AdditionalPrefix string `json:"additional_prefix,omitempty"`
+	AdditionalSuffix string `json:"additional_suffix,omitempty"`
+	WithProvider     bool   `json:"with_provider,omitempty"`
+}
+
+func (o *OverrideTagOptions) UnmarshalJSON(content []byte) error {
+	type native OverrideTagOptions
+	var decoded native
+	err := json.Unmarshal(content, &decoded)
+	if err != nil {
+		return err
+	}
+	decoded.AdditionalPrefix = strings.TrimLeftFunc(decoded.AdditionalPrefix, unicode.IsSpace)
+	decoded.AdditionalSuffix = strings.TrimRightFunc(decoded.AdditionalSuffix, unicode.IsSpace)
+	*o = OverrideTagOptions(decoded)
+	return nil
+}
+
+func (o *OverrideTagOptions) Apply(tag string) string {
+	if o == nil {
+		return tag
+	}
+	prefix := strings.TrimLeftFunc(o.AdditionalPrefix, unicode.IsSpace)
+	suffix := strings.TrimRightFunc(o.AdditionalSuffix, unicode.IsSpace)
+	if prefix == "" && suffix == "" {
+		return tag
+	}
+	return prefix + tag + suffix
+}
+
+func (o *OverrideTagOptions) Resolve(tag string, providerTag string) string {
+	tag = o.Apply(tag)
+	if o != nil && o.WithProvider && providerTag != "" {
+		return "[" + providerTag + "] " + tag
+	}
+	return tag
 }
 
 type OverrideDialerOptions struct {
@@ -179,6 +217,11 @@ type OverrideDialerOptions struct {
 
 	// Deprecated: migrated to domain resolver
 	DomainStrategy *DomainStrategy `json:"domain_strategy,omitempty" schema:"omit"`
+}
+
+type OverrideAnyTLSOptions struct {
+	ClientMetadata *string `json:"client_metadata,omitempty"`
+	DisableReuse   *bool   `json:"disable_reuse,omitempty"`
 }
 
 type OverrideTLSOptions struct {
