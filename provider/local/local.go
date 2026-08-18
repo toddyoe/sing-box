@@ -55,15 +55,13 @@ func NewProviderInline(ctx context.Context, router adapter.Router, logFactory lo
 		logger      = logFactory.NewLogger(F.ToString("provider/inline", "[", tag, "]"))
 	)
 	provider := &ProviderLocal{
-		Adapter: provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeInline, options.HealthCheck),
+		Adapter: provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeInline, options.HealthCheck, nil),
 		ctx:     ctx,
 		logger:  logger,
 	}
-	provider.RewriteDetourForProvider(options.Outbounds, options.Endpoints)
-	provider.UpdateOutbounds(nil, options.Outbounds)
+	provider.UpdateOutbounds(nil, options.Outbounds, options.Endpoints)
 	if len(options.Endpoints) > 0 {
-		provider.RewriteDetourForProviderEndpoints(options.Endpoints, options.Outbounds)
-		provider.UpdateEndpoints(nil, options.Endpoints)
+		provider.UpdateEndpoints(nil, options.Endpoints, options.Outbounds)
 	}
 	return provider, nil
 }
@@ -78,7 +76,7 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 		logger      = logFactory.NewLogger(F.ToString("provider/local", "[", tag, "]"))
 	)
 	provider := &ProviderLocal{
-		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeLocal, options.HealthCheck),
+		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeLocal, options.HealthCheck, options.OverrideTag),
 		ctx:      ctx,
 		logger:   logger,
 		provider: service.FromContext[adapter.ProviderManager](ctx),
@@ -150,13 +148,13 @@ func (s *ProviderLocal) reloadFile(path string) error {
 		return closeErr
 	}
 	s.lastUpdated = fileInfo.ModTime()
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, string(content), s.overrideDialer, s.overrideTLS, s.overrideAnyTLS, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, string(content), s.overrideDialer, s.overrideTLS, s.overrideAnyTLS)
 	if err != nil {
 		return err
 	}
-	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
+	s.UpdateOutbounds(s.lastOutOpts, outboundOpts, endpointOpts)
 	s.lastOutOpts = outboundOpts
-	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
+	s.UpdateEndpoints(s.lastEPOpts, endpointOpts, outboundOpts)
 	s.lastEPOpts = endpointOpts
 	return nil
 }
