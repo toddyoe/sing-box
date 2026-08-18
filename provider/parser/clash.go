@@ -1031,13 +1031,18 @@ func clashTransport(network string, httpOpts HTTPOptions, h2Opts HTTP2Options, g
 				},
 			}
 		}
+		path, maxEarlyData, earlyDataHeaderName := parseV2RayWebsocketEarlyData(
+			wsOpts.Path,
+			uint32(wsOpts.MaxEarlyData),
+			wsOpts.EarlyDataHeaderName,
+		)
 		return &option.V2RayTransportOptions{
 			Type: C.V2RayTransportTypeWebsocket,
 			WebsocketOptions: option.V2RayWebsocketOptions{
-				Path:                wsOpts.Path,
+				Path:                path,
 				Headers:             headers,
-				MaxEarlyData:        uint32(wsOpts.MaxEarlyData),
-				EarlyDataHeaderName: wsOpts.EarlyDataHeaderName,
+				MaxEarlyData:        maxEarlyData,
+				EarlyDataHeaderName: earlyDataHeaderName,
 			},
 		}
 	default:

@@ -112,13 +112,46 @@ func shadowsocksPluginOptions(plugin string) string {
 }
 
 func v2rayTransportWsPath(WebsocketOptions *option.V2RayWebsocketOptions, path string) {
-	reg := regexp.MustCompile(`^(.*?)(?:\?ed=(\d*))?$`)
-	result := reg.FindStringSubmatch(path)
-	WebsocketOptions.Path = result[1]
-	if result[2] != "" {
-		WebsocketOptions.EarlyDataHeaderName = "Sec-WebSocket-Protocol"
-		WebsocketOptions.MaxEarlyData = StringToType[uint32](result[2])
+	WebsocketOptions.Path, WebsocketOptions.MaxEarlyData, WebsocketOptions.EarlyDataHeaderName = parseV2RayWebsocketEarlyData(
+		path,
+		WebsocketOptions.MaxEarlyData,
+		WebsocketOptions.EarlyDataHeaderName,
+	)
+}
+
+func parseV2RayWebsocketEarlyData(path string, maxEarlyData uint32, earlyDataHeaderName string) (string, uint32, string) {
+	if path == "" {
+		return path, maxEarlyData, earlyDataHeaderName
 	}
+	parsed, err := url.Parse(path)
+	if err != nil {
+		return path, maxEarlyData, earlyDataHeaderName
+	}
+	query := parsed.Query()
+	rawED := query.Get("ed")
+	if rawED == "" {
+		return path, maxEarlyData, earlyDataHeaderName
+	}
+	parsedED, err := strconv.ParseUint(rawED, 10, 32)
+	if err != nil || parsedED == 0 {
+		return path, maxEarlyData, earlyDataHeaderName
+	}
+	query.Del("ed")
+	parsed.RawQuery = query.Encode()
+	newPath := parsed.EscapedPath()
+	if newPath == "" {
+		newPath = "/"
+	}
+	if parsed.RawQuery != "" {
+		newPath += "?" + parsed.RawQuery
+	}
+	if maxEarlyData == 0 {
+		maxEarlyData = uint32(parsedED)
+	}
+	if earlyDataHeaderName == "" {
+		earlyDataHeaderName = "Sec-WebSocket-Protocol"
+	}
+	return newPath, maxEarlyData, earlyDataHeaderName
 }
 
 func v2rayTransportWs(host string, path string) option.V2RayWebsocketOptions {
