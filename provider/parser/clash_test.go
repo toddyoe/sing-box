@@ -167,6 +167,35 @@ proxies:
 	}
 }
 
+func TestParseClashWebSocketEmptyHostHeader(t *testing.T) {
+	outbounds, endpoints, err := ParseClashSubscription(context.Background(), `
+proxies:
+  - name: vless-ws
+    type: vless
+    server: starlink.nexusmail.uk
+    port: 8443
+    uuid: 11111111-1111-1111-1111-111111111111
+    tls: false
+    network: ws
+    ws-opts:
+      path: "/"
+      headers:
+        Host: ""
+        User-Agent: Mozilla
+`)
+	require.NoError(t, err)
+	require.Empty(t, endpoints)
+	require.Len(t, outbounds, 1)
+
+	options, ok := outbounds[0].Options.(*option.VLESSOutboundOptions)
+	require.True(t, ok)
+	require.NotNil(t, options.Transport)
+	require.Equal(t, C.V2RayTransportTypeWebsocket, options.Transport.Type)
+	require.Equal(t, "/", options.Transport.WebsocketOptions.Path)
+	require.NotContains(t, options.Transport.WebsocketOptions.Headers, "Host")
+	require.Equal(t, badoption.Listable[string]{"Mozilla"}, options.Transport.WebsocketOptions.Headers["User-Agent"])
+}
+
 func TestParseClashWebSocketHTTPUpgradeKeepsEarlyDataQuery(t *testing.T) {
 	outbounds, endpoints, err := ParseClashSubscription(context.Background(), `
 proxies:
