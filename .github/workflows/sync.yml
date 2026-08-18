@@ -1,0 +1,179 @@
+name: Sync
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-reF1nd-testing
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Rebase onto upstream and reapply local commits
+    runs-on: ubuntu-latest
+    steps:
+      # GITHUB_TOKEN cannot create/update workflow files. Resetting onto
+      # upstream often adds .github/workflows/*.yml (e.g. android-ebpf.yml),
+      # and push is then rejected. Use a PAT with `repo` + `workflow`
+      # (fine-grained: Contents + Workflows read/write) as SYNC_GITHUB_TOKEN.
+      - name: Require SYNC_GITHUB_TOKEN
+        env:
+          SYNC_GITHUB_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$SYNC_GITHUB_TOKEN" ]; then
+            echo "::error::Secret SYNC_GITHUB_TOKEN is missing. Create a PAT with repo + workflow scopes and add it as a repository secret named SYNC_GITHUB_TOKEN."
+            exit 1
+          fi
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: reF1nd-testing
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.SYNC_GITHUB_TOKEN }}
+
+      - name: Sync upstream and reapply local commits
+        env:
+          UPSTREAM_URL: https://github.com/reF1nd/sing-box.git
+          UPSTREAM_BRANCH: reF1nd-testing
+          LOCAL_BRANCH: reF1nd-testing
+          # Commits authored by these names/emails are this fork's own work
+          # Comma-separated. github.repository_owner matches author
+          LOCAL_AUTHORS: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --no-tags origin "$LOCAL_BRANCH"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+          git checkout -B "$LOCAL_BRANCH" "origin/$LOCAL_BRANCH"
+
+          UPSTREAM_REF="upstream/$UPSTREAM_BRANCH"
+
+          # GitHub forks keep the SHAs they cloned. If upstream later rebases or
+          # force-pushes, the fork and upstream share messages/authors but not
+          # commit IDs. `UPSTREAM..HEAD` then lists hundreds of rewritten
+          # upstream commits as "local", and cherry-picking them produces the
+          # "N commits ahead" balloon. Only replay this fork's own authors, and
+          # skip any that are metadata-equivalent to something already upstream.
+
+          AUTHOR_FILE="$(mktemp)"
+          printf '%s' "${LOCAL_AUTHORS:-}" | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+            | grep -v '^$' > "$AUTHOR_FILE" || true
+          if [ ! -s "$AUTHOR_FILE" ]; then
+            echo "LOCAL_AUTHORS is empty" >&2
+            exit 1
+          fi
+
+          AUTHOR_ARGS=()
+          while IFS= read -r needle; do
+            # git --author is a regex; escape metacharacters.
+            escaped="$(printf '%s' "$needle" | sed 's/[].[^$*\\]/\\&/g')"
+            AUTHOR_ARGS+=(--author="$escaped")
+          done < "$AUTHOR_FILE"
+
+          UPSTREAM_SIGS="$(mktemp)"
+          git log --format='%an%x09%ae%x09%at%x09%s' "$UPSTREAM_REF" | sort -u > "$UPSTREAM_SIGS"
+
+          CANDIDATES="$(mktemp)"
+          git rev-list --reverse --no-merges "${AUTHOR_ARGS[@]}" "$UPSTREAM_REF..HEAD" > "$CANDIDATES" || true
+
+          OUR_COMMITS_FILE="$(mktemp)"
+          : > "$OUR_COMMITS_FILE"
+          if [ -s "$CANDIDATES" ]; then
+            while read -r sha; do
+              sig="$(git log -1 --format='%an%x09%ae%x09%at%x09%s' "$sha")"
+              if grep -Fxq "$sig" "$UPSTREAM_SIGS"; then
+                echo "Skipping $sha (equivalent commit already on upstream)"
+                continue
+              fi
+              echo "$sha" >> "$OUR_COMMITS_FILE"
+            done < "$CANDIDATES"
+          fi
+
+          echo "Local-only commits to reapply:"
+          if [ -s "$OUR_COMMITS_FILE" ]; then
+            while read -r sha; do
+              git log -1 --oneline "$sha"
+            done < "$OUR_COMMITS_FILE"
+          else
+            echo "(none)"
+          fi
+
+          ours_count=0
+          if [ -s "$OUR_COMMITS_FILE" ]; then
+            ours_count="$(wc -l < "$OUR_COMMITS_FILE" | tr -d ' ')"
+          fi
+
+          # "Already based on upstream" is not enough: a previous bad sync can
+          # leave hundreds of cherry-picked upstream commits on top. Only skip
+          # when the commits on top are exactly this fork's own work.
+          if git merge-base --is-ancestor "$UPSTREAM_REF" HEAD; then
+            extra_count="$(git rev-list --count "$UPSTREAM_REF..HEAD")"
+            if [ "$extra_count" -eq "$ours_count" ]; then
+              echo "Already based on $UPSTREAM_REF with only $ours_count local commit(s), nothing to sync"
+              exit 0
+            fi
+            echo "Based on $UPSTREAM_REF but HEAD has $extra_count extra commit(s) vs $ours_count local; rewriting"
+          else
+            echo "Not based on $UPSTREAM_REF; resetting and replaying $ours_count local commit(s)"
+          fi
+
+          # Phase 1: force-sync to upstream. Linear history (rebase-style, no merge commit).
+          git reset --hard "$UPSTREAM_REF"
+
+          # Phase 2: replay this fork's own commits on top of the synced tree.
+          apply_commit() {
+            local sha="$1"
+            local subject
+            subject="$(git log -1 --format='%s' "$sha")"
+            echo "Applying $sha $subject"
+
+            set +e
+            git cherry-pick -x "$sha"
+            local status=$?
+            set -e
+
+            if [ "$status" -eq 0 ]; then
+              return 0
+            fi
+
+            local conflicts
+            conflicts="$(git diff --name-only --diff-filter=U || true)"
+            if [ -z "$conflicts" ]; then
+              echo "Skipping empty or already-applied commit $sha"
+              git cherry-pick --skip || git cherry-pick --abort || true
+              return 0
+            fi
+
+            # Apply-local-commits phase: keep this repository's incoming changes on conflict.
+            echo "Conflict while applying $sha, taking this repository's commit"
+            git checkout --theirs -- .
+            git add -A
+            if git diff --cached --quiet; then
+              git cherry-pick --skip || git cherry-pick --abort || true
+              return 0
+            fi
+            GIT_EDITOR=true git cherry-pick --continue
+          }
+
+          if [ -s "$OUR_COMMITS_FILE" ]; then
+            while read -r sha; do
+              apply_commit "$sha"
+            done < "$OUR_COMMITS_FILE"
+          fi
+
+          echo "Resulting commits on top of upstream:"
+          git log --oneline "$UPSTREAM_REF..HEAD" || true
+
+          git push --force-with-lease="refs/heads/${LOCAL_BRANCH}:origin/${LOCAL_BRANCH}" origin "HEAD:${LOCAL_BRANCH}"
