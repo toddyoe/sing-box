@@ -867,7 +867,13 @@ func clashHeaders(headers map[string]string) map[string]badoption.Listable[strin
 	}
 	result := make(map[string]badoption.Listable[string])
 	for key, value := range headers {
+		if value == "" {
+			continue
+		}
 		result[key] = []string{value}
+	}
+	if len(result) == 0 {
+		return nil
 	}
 	return result
 }
