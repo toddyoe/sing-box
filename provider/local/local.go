@@ -42,7 +42,6 @@ type ProviderLocal struct {
 	lastEPOpts  []option.Endpoint
 	lastUpdated time.Time
 	watcher     *fswatch.Watcher
-	closed      bool
 
 	overrideDialer *option.OverrideDialerOptions
 	overrideTLS    *option.OverrideTLSOptions
@@ -56,16 +55,13 @@ func NewProviderInline(ctx context.Context, router adapter.Router, logFactory lo
 		logger      = logFactory.NewLogger(F.ToString("provider/inline", "[", tag, "]"))
 	)
 	provider := &ProviderLocal{
-		Adapter: provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeInline, options.HealthCheck),
+		Adapter: provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeInline, options.HealthCheck, nil),
 		ctx:     ctx,
 		logger:  logger,
 	}
-	provider.RewriteDetourForProvider(options.Outbounds, options.Endpoints)
+	provider.UpdateOutbounds(nil, options.Outbounds, options.Endpoints)
 	if len(options.Endpoints) > 0 {
-		provider.RewriteDetourForProviderEndpoints(options.Endpoints, options.Outbounds)
-	}
-	if err := provider.UpdateNodes(options.Outbounds, options.Endpoints); err != nil {
-		return nil, err
+		provider.UpdateEndpoints(nil, options.Endpoints, options.Outbounds)
 	}
 	return provider, nil
 }
@@ -80,7 +76,7 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 		logger      = logFactory.NewLogger(F.ToString("provider/local", "[", tag, "]"))
 	)
 	provider := &ProviderLocal{
-		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeLocal, options.HealthCheck),
+		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeLocal, options.HealthCheck, options.OverrideTag),
 		ctx:      ctx,
 		logger:   logger,
 		provider: service.FromContext[adapter.ProviderManager](ctx),
@@ -98,6 +94,7 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 			if uErr != nil {
 				logger.Error(E.Cause(uErr, "reload provider ", tag))
 			}
+			provider.UpdateGroups()
 		},
 	})
 	if err != nil {
@@ -108,14 +105,12 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 }
 
 func (s *ProviderLocal) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
-	if err := s.Adapter.Start(); err != nil {
-		return err
-	}
 	if s.path != "" {
 		err := s.reloadFile(s.path)
 		if err != nil {
 			return err
 		}
+		s.UpdateGroups()
 		if s.watcher != nil {
 			err := s.watcher.Start()
 			if err != nil {
@@ -123,8 +118,7 @@ func (s *ProviderLocal) StartContext(ctx context.Context, startContext *adapter.
 			}
 		}
 	}
-	s.UpdateGroups()
-	return nil
+	return s.Adapter.Start()
 }
 
 func (s *ProviderLocal) UpdatedAt() time.Time {
@@ -136,9 +130,6 @@ func (s *ProviderLocal) UpdatedAt() time.Time {
 func (s *ProviderLocal) reloadFile(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return context.Canceled
-	}
 	file, err := filemanager.Open(s.ctx, path)
 	if err != nil {
 		return err
@@ -157,24 +148,17 @@ func (s *ProviderLocal) reloadFile(path string) error {
 		return closeErr
 	}
 	s.lastUpdated = fileInfo.ModTime()
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, string(content), s.overrideDialer, s.overrideTLS, s.overrideAnyTLS, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, string(content), s.overrideDialer, s.overrideTLS, s.overrideAnyTLS)
 	if err != nil {
 		return err
 	}
-	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
-	s.UpdateGroups()
-	if updateErr != nil {
-		return updateErr
-	}
+	s.UpdateOutbounds(s.lastOutOpts, outboundOpts, endpointOpts)
 	s.lastOutOpts = outboundOpts
+	s.UpdateEndpoints(s.lastEPOpts, endpointOpts, outboundOpts)
 	s.lastEPOpts = endpointOpts
 	return nil
 }
 
 func (s *ProviderLocal) Close() error {
-	err := common.Close(common.PtrOrNil(s.watcher))
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.closed = true
-	return E.Errors(err, s.Adapter.Close())
+	return common.Close(&s.Adapter, common.PtrOrNil(s.watcher))
 }

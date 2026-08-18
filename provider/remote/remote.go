@@ -43,8 +43,6 @@ var _ adapter.Provider = (*ProviderRemote)(nil)
 type ProviderRemote struct {
 	provider.Adapter
 	ctx              context.Context
-	fetchAccess      sync.Mutex
-	workers          sync.WaitGroup
 	cancel           context.CancelFunc
 	logger           log.ContextLogger
 	outbound         adapter.OutboundManager
@@ -136,7 +134,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 	logger := logFactory.NewLogger(F.ToString("provider/remote", "[", tag, "]"))
 	url := options.URL
 	return &ProviderRemote{
-		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeRemote, options.HealthCheck),
+		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeRemote, options.HealthCheck, options.OverrideTag),
 		ctx:      ctx,
 		cancel:   cancel,
 		logger:   logger,
@@ -192,14 +190,9 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 			return E.Cause(err, "initial outbound provider: ", s.Tag())
 		}
 	}
-	if err := s.Adapter.Start(); err != nil {
-		return err
-	}
 	s.ticker = time.NewTicker(s.updateInterval)
-	s.workers.Add(1)
-	go func() { defer s.workers.Done(); s.loopUpdate() }()
-	s.UpdateGroups()
-	return nil
+	go s.loopUpdate()
+	return s.Adapter.Start()
 }
 
 func (s *ProviderRemote) Update() error {
@@ -223,9 +216,6 @@ func (s *ProviderRemote) SubscriptionInfo() adapter.SubscriptionInfo {
 
 func (s *ProviderRemote) Close() error {
 	s.cancel()
-	s.workers.Wait()
-	s.fetchAccess.Lock()
-	defer s.fetchAccess.Unlock()
 	if s.ticker != nil {
 		s.ticker.Stop()
 	}
@@ -236,7 +226,7 @@ func (s *ProviderRemote) resolveTransport() (adapter.HTTPTransport, error) {
 	httpClientManager := service.FromContext[adapter.HTTPClientManager](s.ctx)
 	if s.httpClientOptions != nil && !s.httpClientOptions.IsEmpty() {
 		if s.downloadDetour != "" {
-			return nil, E.New("http_client conflicts with deprecated download_detour field")
+			return nil, E.New("http_client is conflict with deprecated download_detour field")
 		}
 		return httpClientManager.ResolveTransport(s.ctx, s.logger, *s.httpClientOptions)
 	}
@@ -268,11 +258,6 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 		return E.New("provider is updating")
 	}
 	defer s.updating.Store(false)
-	s.fetchAccess.Lock()
-	defer s.fetchAccess.Unlock()
-	if err := s.ctx.Err(); err != nil {
-		return err
-	}
 	s.logger.Debug("updating outbound provider ", s.Tag(), " from URL: ", s.url)
 	req, err := http.NewRequest(http.MethodGet, s.url, nil)
 	if err != nil {
@@ -289,7 +274,6 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 	infoStr := resp.Header.Get("subscription-userinfo")
 	info, hasInfo := parseInfo(infoStr)
 	switch resp.StatusCode {
@@ -331,9 +315,16 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	default:
 		return E.New("unexpected status: ", resp.Status)
 	}
+	defer resp.Body.Close()
 	contentRaw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
+	}
+	eTagHeader := resp.Header.Get("Etag")
+	if eTagHeader != "" {
+		s.infoMu.Lock()
+		s.lastEtag = eTagHeader
+		s.infoMu.Unlock()
 	}
 	content, _ := parser.DecodeBase64URLSafe(string(contentRaw))
 	if !hasInfo {
@@ -348,7 +339,6 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	}
 	s.UpdateGroups()
 	s.infoMu.Lock()
-	s.lastEtag = resp.Header.Get("Etag")
 	s.subscriptionInfo = info
 	s.lastUpdated = time.Now()
 	s.infoMu.Unlock()
@@ -467,12 +457,9 @@ func (s *ProviderRemote) loadFromContent(contentRaw []byte) error {
 	if err != nil {
 		return err
 	}
-	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
-	s.UpdateGroups()
-	if updateErr != nil {
-		return updateErr
-	}
+	s.UpdateOutbounds(s.lastOutOpts, outboundOpts, endpointOpts)
 	s.lastOutOpts = outboundOpts
+	s.UpdateEndpoints(s.lastEPOpts, endpointOpts, outboundOpts)
 	s.lastEPOpts = endpointOpts
 	return nil
 }
@@ -556,7 +543,7 @@ func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionIn
 }
 
 func (s *ProviderRemote) updateProviderFromContent(content string) error {
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.overrideTLS, s.overrideAnyTLS, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.overrideTLS, s.overrideAnyTLS)
 	if err != nil {
 		return err
 	}
@@ -566,12 +553,9 @@ func (s *ProviderRemote) updateProviderFromContent(content string) error {
 	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool {
 		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
 	})
-	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
-	s.UpdateGroups()
-	if updateErr != nil {
-		return updateErr
-	}
+	s.UpdateOutbounds(s.lastOutOpts, outboundOpts, endpointOpts)
 	s.lastOutOpts = outboundOpts
+	s.UpdateEndpoints(s.lastEPOpts, endpointOpts, outboundOpts)
 	s.lastEPOpts = endpointOpts
 	return nil
 }

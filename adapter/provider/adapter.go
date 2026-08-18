@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,38 +19,33 @@ import (
 )
 
 type Adapter struct {
-	ctx              context.Context
-	cancel           context.CancelFunc
-	workers          sync.WaitGroup
-	closed           bool
-	workerAccess     sync.Mutex
-	outbound         adapter.DynamicOutboundManager
-	endpoint         adapter.DynamicEndpointManager
-	router           adapter.Router
-	logFactory       log.Factory
-	logger           log.ContextLogger
-	providerType     string
-	providerTag      string
-	outboundsAccess  sync.RWMutex
-	outbounds        []adapter.Outbound
-	outboundsByTag   map[string]adapter.Outbound
-	appliedOutbounds map[string]option.Outbound
-	appliedEndpoints map[string]option.Endpoint
-	endpoints        []adapter.Outbound
-	endpointsByTag   map[string]adapter.Outbound
-	ticker           *time.Ticker
-	checking         atomic.Bool
-	history          *urltest.HistoryStorage
-	callbackAccess   sync.Mutex
-	callbacks        list.List[adapter.ProviderUpdateCallback]
+	ctx             context.Context
+	outbound        adapter.OutboundManager
+	endpoint        adapter.EndpointManager
+	router          adapter.Router
+	logFactory      log.Factory
+	logger          log.ContextLogger
+	providerType    string
+	providerTag     string
+	outboundsAccess sync.RWMutex
+	outbounds       []adapter.Outbound
+	outboundsByTag  map[string]adapter.Outbound
+	endpoints       []adapter.Outbound
+	endpointsByTag  map[string]adapter.Outbound
+	ticker          *time.Ticker
+	checking        atomic.Bool
+	history         *urltest.HistoryStorage
+	callbackAccess  sync.Mutex
+	callbacks       list.List[adapter.ProviderUpdateCallback]
 
-	link     string
-	enabled  bool
-	timeout  time.Duration
-	interval time.Duration
+	link        string
+	enabled     bool
+	timeout     time.Duration
+	interval    time.Duration
+	overrideTag *option.OverrideTagOptions
 }
 
-func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.OutboundManager, endpoint adapter.EndpointManager, logFactory log.Factory, logger log.ContextLogger, providerTag string, providerType string, options option.ProviderHealthCheckOptions) Adapter {
+func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.OutboundManager, endpoint adapter.EndpointManager, logFactory log.Factory, logger log.ContextLogger, providerTag string, providerType string, options option.ProviderHealthCheckOptions, overrideTag *option.OverrideTagOptions) Adapter {
 	timeout := time.Duration(options.Timeout)
 	if timeout == 0 {
 		timeout = 3 * time.Second
@@ -61,21 +57,16 @@ func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.Out
 	if interval < time.Minute {
 		interval = time.Minute
 	}
-	dynamicOutbound, _ := outbound.(adapter.DynamicOutboundManager)
-	dynamicEndpoint, _ := endpoint.(adapter.DynamicEndpointManager)
-	ctx, cancel := context.WithCancel(ctx)
 	return Adapter{
-		cancel:           cancel,
-		appliedOutbounds: make(map[string]option.Outbound),
-		appliedEndpoints: make(map[string]option.Endpoint),
-		ctx:              ctx,
-		outbound:         dynamicOutbound,
-		endpoint:         dynamicEndpoint,
-		router:           router,
-		logFactory:       logFactory,
-		logger:           logger,
-		providerType:     providerType,
-		providerTag:      providerTag,
+		ctx:          ctx,
+		outbound:     outbound,
+		endpoint:     endpoint,
+		router:       router,
+		logFactory:   logFactory,
+		logger:       logger,
+		providerType: providerType,
+		providerTag:  providerTag,
+		overrideTag:  overrideTag,
 
 		enabled:  options.Enabled,
 		link:     options.URL,
@@ -91,7 +82,7 @@ func (a *Adapter) Start() error {
 	}
 	if a.enabled {
 		a.ticker = time.NewTicker(a.interval)
-		a.run(a.loopCheck)
+		go a.loopCheck()
 	}
 	return nil
 }
@@ -123,27 +114,88 @@ func (a *Adapter) Outbound(tag string) (adapter.Outbound, bool) {
 	return detour, ok
 }
 
+func (a *Adapter) resolveTag(source string) string {
+	return a.overrideTag.Resolve(source, a.providerTag)
+}
+
+func (a *Adapter) uniquifyTag(kind string, baseTag string, seen map[string]bool) string {
+	tag := baseTag
+	for n := 2; seen[tag]; n++ {
+		tag = F.ToString(baseTag, " (", n, ")")
+	}
+	if tag != baseTag {
+		a.logger.Warn("duplicate ", kind, " tag ", baseTag, " in provider, renamed to ", tag)
+	}
+	seen[tag] = true
+	return tag
+}
+
 func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 	tags := make([]string, len(newOpts))
 	seen := make(map[string]bool)
 	for i, opt := range newOpts {
-		var baseTag string
-		if opt.Tag != "" {
-			baseTag = F.ToString(a.providerTag, "/", opt.Tag)
-		} else {
-			baseTag = F.ToString(a.providerTag, "/", i)
+		source := opt.Tag
+		if source == "" {
+			source = F.ToString(i)
 		}
-		tag := baseTag
-		for n := 2; seen[tag]; n++ {
-			tag = F.ToString(baseTag, " (", n, ")")
-		}
-		if tag != baseTag {
-			a.logger.Warn("duplicate outbound tag ", baseTag, " in provider, renamed to ", tag)
-		}
-		seen[tag] = true
-		tags[i] = tag
+		tags[i] = a.uniquifyTag("outbound", a.resolveTag(source), seen)
 	}
 	return tags
+}
+
+func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Outbound, extraEndpoints ...[]option.Endpoint) {
+	newTags := a.resolveOutboundTags(newOpts)
+	var endpoints []option.Endpoint
+	if len(extraEndpoints) > 0 {
+		endpoints = extraEndpoints[0]
+	}
+	a.rewriteOutboundDetours(newOpts, newTags, endpoints)
+	var (
+		oldOptByTag    = make(map[string]option.Outbound)
+		outbounds      = make([]adapter.Outbound, 0, len(newOpts))
+		outboundsByTag = make(map[string]adapter.Outbound)
+	)
+	for _, opt := range oldOpts {
+		oldOptByTag[opt.Tag] = opt
+	}
+	activeTags := a.activeOutboundTags()
+	a.removeUseless(newTags)
+	for i, opt := range newOpts {
+		tag := newTags[i]
+		outbound, exist := a.outbound.Outbound(tag)
+		_, active := activeTags[tag]
+		if !exist || !active || !reflect.DeepEqual(opt, oldOptByTag[opt.Tag]) {
+			err := a.outbound.Create(
+				adapter.WithContext(a.ctx, &adapter.InboundContext{
+					Outbound: tag,
+				}),
+				a.router,
+				a.logFactory.NewLogger(F.ToString("outbound/", opt.Type, "[", tag, "]")),
+				tag,
+				opt.Type,
+				opt.Options,
+			)
+			if err != nil {
+				a.logger.Warn(err, " in ", tag, ", skip create this outbound")
+				if active {
+					if closeErr := a.outbound.Remove(tag); closeErr != nil {
+						a.logger.Error(closeErr, "close outbound [", tag, "]")
+					}
+				}
+				continue
+			}
+			outbound, _ = a.outbound.Outbound(tag)
+		}
+		outbounds = append(outbounds, outbound)
+		outboundsByTag[tag] = outbound
+	}
+	a.outboundsAccess.Lock()
+	a.outbounds = outbounds
+	a.outboundsByTag = outboundsByTag
+	a.outboundsAccess.Unlock()
+	if a.enabled && a.history != nil {
+		go a.HealthCheck(a.ctx)
+	}
 }
 
 func (a *Adapter) HealthCheck(ctx context.Context) (map[string]uint16, error) {
@@ -178,11 +230,6 @@ func (a *Adapter) UpdateGroups() {
 }
 
 func (a *Adapter) Close() error {
-	a.workerAccess.Lock()
-	a.closed = true
-	a.cancel()
-	a.workerAccess.Unlock()
-	a.workers.Wait()
 	if a.ticker != nil {
 		a.ticker.Stop()
 	}
@@ -264,77 +311,126 @@ func (a *Adapter) healthcheck(ctx context.Context) (map[string]uint16, error) {
 	return result, nil
 }
 
-func (a *Adapter) RewriteDetourForProvider(opts []option.Outbound, endpointOpts ...[]option.Endpoint) {
-	tagMapping := make(map[string]string)
-	for _, opt := range opts {
-		if opt.Tag != "" {
-			tagMapping[opt.Tag] = F.ToString(a.providerTag, "/", opt.Tag)
-		}
-	}
-	for _, endpoints := range endpointOpts {
-		for _, opt := range endpoints {
-			if opt.Tag != "" {
-				tagMapping[opt.Tag] = F.ToString(a.providerTag, "/", opt.Tag)
-			}
-		}
-	}
-	for _, opt := range opts {
-		if dialerWrapper, ok := opt.Options.(option.DialerOptionsWrapper); ok {
-			dialerOptions := dialerWrapper.TakeDialerOptions()
-			if newDetour, found := tagMapping[dialerOptions.Detour]; found {
-				dialerOptions.Detour = newDetour
-				dialerWrapper.ReplaceDialerOptions(dialerOptions)
-			}
-		}
+func (a *Adapter) rewriteOutboundDetours(outbounds []option.Outbound, outboundTags []string, endpoints []option.Endpoint) {
+	mapping := a.buildTagMapping(outbounds, outboundTags, endpoints, a.resolveEndpointTags(endpoints))
+	for _, opt := range outbounds {
+		rewriteDialerDetour(opt.Options, mapping)
 	}
 }
 
-func (a *Adapter) RewriteDetourForProviderEndpoints(opts []option.Endpoint, outboundOpts ...[]option.Outbound) {
-	tagMapping := make(map[string]string)
-	for _, opt := range opts {
+func (a *Adapter) rewriteEndpointDetours(endpoints []option.Endpoint, endpointTags []string, outbounds []option.Outbound) {
+	mapping := a.buildTagMapping(outbounds, a.resolveOutboundTags(outbounds), endpoints, endpointTags)
+	for _, opt := range endpoints {
+		rewriteDialerDetour(opt.Options, mapping)
+	}
+}
+
+func (a *Adapter) buildTagMapping(outbounds []option.Outbound, outboundTags []string, endpoints []option.Endpoint, endpointTags []string) map[string]string {
+	mapping := make(map[string]string, len(outbounds)+len(endpoints))
+	for i, opt := range outbounds {
+		if i >= len(outboundTags) {
+			continue
+		}
 		if opt.Tag != "" {
-			tagMapping[opt.Tag] = F.ToString(a.providerTag, "/", opt.Tag)
+			mapping[opt.Tag] = outboundTags[i]
 		}
+		mapping[outboundTags[i]] = outboundTags[i]
 	}
-	for _, outbounds := range outboundOpts {
-		for _, opt := range outbounds {
-			if opt.Tag != "" {
-				tagMapping[opt.Tag] = F.ToString(a.providerTag, "/", opt.Tag)
-			}
+	for i, opt := range endpoints {
+		if i >= len(endpointTags) {
+			continue
 		}
-	}
-	for _, opt := range opts {
-		if dialerWrapper, ok := opt.Options.(option.DialerOptionsWrapper); ok {
-			dialerOptions := dialerWrapper.TakeDialerOptions()
-			if newDetour, found := tagMapping[dialerOptions.Detour]; found {
-				dialerOptions.Detour = newDetour
-				dialerWrapper.ReplaceDialerOptions(dialerOptions)
-			}
+		if opt.Tag != "" {
+			mapping[opt.Tag] = endpointTags[i]
 		}
+		mapping[endpointTags[i]] = endpointTags[i]
 	}
+	return mapping
+}
+
+func rewriteDialerDetour(options any, tagMapping map[string]string) {
+	dialerWrapper, ok := options.(option.DialerOptionsWrapper)
+	if !ok {
+		return
+	}
+	dialerOptions := dialerWrapper.TakeDialerOptions()
+	if dialerOptions.Detour == "" {
+		return
+	}
+	newDetour, found := tagMapping[dialerOptions.Detour]
+	if !found || newDetour == dialerOptions.Detour {
+		return
+	}
+	dialerOptions.Detour = newDetour
+	dialerWrapper.ReplaceDialerOptions(dialerOptions)
 }
 
 func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
 	tags := make([]string, len(newOpts))
 	seen := make(map[string]bool)
 	for i, opt := range newOpts {
-		var baseTag string
-		if opt.Tag != "" {
-			baseTag = F.ToString(a.providerTag, "/", opt.Tag)
-		} else {
-			baseTag = F.ToString(a.providerTag, "/endpoint-", i)
+		source := opt.Tag
+		if source == "" {
+			source = F.ToString("endpoint-", i)
 		}
-		tag := baseTag
-		for n := 2; seen[tag]; n++ {
-			tag = F.ToString(baseTag, " (", n, ")")
-		}
-		if tag != baseTag {
-			a.logger.Warn("duplicate endpoint tag ", baseTag, " in provider, renamed to ", tag)
-		}
-		seen[tag] = true
-		tags[i] = tag
+		tags[i] = a.uniquifyTag("endpoint", a.resolveTag(source), seen)
 	}
 	return tags
+}
+
+func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.Endpoint, extraOutbounds ...[]option.Outbound) {
+	newTags := a.resolveEndpointTags(newOpts)
+	var outbounds []option.Outbound
+	if len(extraOutbounds) > 0 {
+		outbounds = extraOutbounds[0]
+	}
+	a.rewriteEndpointDetours(newOpts, newTags, outbounds)
+	var (
+		oldOptByTag    = make(map[string]option.Endpoint)
+		endpoints      []adapter.Outbound
+		endpointsByTag = make(map[string]adapter.Outbound)
+	)
+	for _, opt := range oldOpts {
+		oldOptByTag[opt.Tag] = opt
+	}
+	activeTags := a.activeEndpointTags()
+	a.removeUselessEndpoints(newTags)
+	for i, opt := range newOpts {
+		tag := newTags[i]
+		ep, exist := a.endpoint.Get(tag)
+		_, active := activeTags[tag]
+		if !exist || !active || !reflect.DeepEqual(opt, oldOptByTag[opt.Tag]) {
+			err := a.endpoint.Create(
+				adapter.WithContext(a.ctx, &adapter.InboundContext{
+					Outbound: tag,
+				}),
+				a.router,
+				a.logFactory.NewLogger(F.ToString("endpoint/", opt.Type, "[", tag, "]")),
+				tag,
+				opt.Type,
+				opt.Options,
+			)
+			if err != nil {
+				a.logger.Warn(err, " in ", tag, ", skip create this endpoint")
+				if active {
+					if closeErr := a.endpoint.Remove(tag); closeErr != nil {
+						a.logger.Error(closeErr, "close endpoint [", tag, "]")
+					}
+				}
+				continue
+			}
+			ep, _ = a.endpoint.Get(tag)
+		}
+		endpoints = append(endpoints, ep)
+		endpointsByTag[tag] = ep
+	}
+	a.outboundsAccess.Lock()
+	a.endpoints = endpoints
+	a.endpointsByTag = endpointsByTag
+	a.outboundsAccess.Unlock()
+	if a.enabled && a.history != nil {
+		go a.HealthCheck(a.ctx)
+	}
 }
 
 func (a *Adapter) removeUselessEndpoints(newTags []string) {
@@ -396,14 +492,4 @@ func (a *Adapter) removeUseless(newTags []string) {
 			}
 		}
 	}
-}
-
-func (a *Adapter) run(fn func()) {
-	a.workerAccess.Lock()
-	defer a.workerAccess.Unlock()
-	if a.closed {
-		return
-	}
-	a.workers.Add(1)
-	go func() { defer a.workers.Done(); fn() }()
 }
